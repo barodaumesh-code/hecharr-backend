@@ -58,6 +58,14 @@ app.get('/', (req, res) => {
   });
 });
 
+// ===== CONFIG (expose publishable key safely) =====
+app.get('/config', (req, res) => {
+  if (!process.env.STRIPE_PUBLISHABLE_KEY) {
+    return res.status(500).json({ error: 'STRIPE_PUBLISHABLE_KEY not set on server' });
+  }
+  res.json({ publishableKey: process.env.STRIPE_PUBLISHABLE_KEY });
+});
+
 // ===== CREATE PAYMENT INTENT =====
 // Frontend sends: { amount (integer cents/subunits), currency, customer, items }
 app.post('/create-payment-intent', async (req, res) => {
@@ -75,6 +83,8 @@ app.post('/create-payment-intent', async (req, res) => {
     // Fall back to USD if currency not supported by Stripe
     const stripeCurrency = STRIPE_SUPPORTED.includes(rawCurrency) ? rawCurrency : 'USD';
 
+    const idempotencyKey = `pi-${(validEmail || 'guest').replace(/[^a-z0-9]/gi,'-')}-${Math.round(amount)}-${stripeCurrency}`;
+
     const paymentIntent = await stripe.paymentIntents.create({
       amount: Math.round(amount),
       currency: stripeCurrency.toLowerCase(),
@@ -87,7 +97,7 @@ app.post('/create-payment-intent', async (req, res) => {
       description: 'HECHARR Multivitamin Gummies Order',
       receipt_email: validEmail || undefined,
       automatic_payment_methods: { enabled: true }
-    });
+    }, { idempotencyKey });
 
     console.log(`✅ PaymentIntent created: ${paymentIntent.id} — ${Math.round(amount)} ${stripeCurrency}`);
     res.json({
@@ -522,8 +532,13 @@ app.post('/cancel-subscription', async (req, res) => {
 app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!webhookSecret) {
+    console.error('❌ STRIPE_WEBHOOK_SECRET is not set — rejecting webhook');
+    return res.status(500).send('Webhook secret not configured');
+  }
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET || '');
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
   } catch (err) {
     console.error('Webhook signature error:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
@@ -585,6 +600,39 @@ app.post('/webhook', async (req, res) => {
       break;
     case 'checkout.session.completed':
       console.log(`✅ Webhook: Checkout session completed ${event.data.object.id} — Mode: ${event.data.object.mode}`);
+      // Save the first order for new subscriptions (renewals are handled by invoice.paid)
+      if (event.data.object.mode === 'subscription') {
+        try {
+          const session = event.data.object;
+          const customerEmail = session.customer_details?.email || session.customer_email || '';
+          const orderId = 'HCSUB' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).substr(2, 3).toUpperCase();
+
+          let userId = null;
+          if (customerEmail) {
+            const { data: existingUser } = await supabase
+              .from('users')
+              .select('id')
+              .eq('email', customerEmail)
+              .maybeSingle();
+            userId = existingUser?.id || null;
+          }
+
+          await supabase.from('orders').insert({
+            order_id: orderId,
+            stripe_payment_intent_id: session.payment_intent || session.id,
+            user_id: userId,
+            customer_email: customerEmail,
+            customer_name: session.customer_details?.name || '',
+            items: [{ name: 'Subscription — First Order', qty: 1, price: (session.amount_total || 0) / 100 }],
+            total_amount: (session.amount_total || 0) / 100,
+            currency: (session.currency || 'usd').toUpperCase(),
+            status: 'paid',
+          });
+          console.log(`✅ Subscription first-order saved: ${orderId}`);
+        } catch (saveErr) {
+          console.error('Failed to save subscription first order:', saveErr.message);
+        }
+      }
       break;
     default:
       console.log(`Webhook: ${event.type}`);
@@ -596,7 +644,9 @@ app.post('/webhook', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n🍬 HECHARR Backend v2 running on port ${PORT}`);
-  console.log(`   Stripe:   ${process.env.STRIPE_SECRET_KEY ? '✅' : '❌ MISSING'}`);
-  console.log(`   Supabase: ${process.env.SUPABASE_URL ? '✅' : '❌ MISSING'}`);
-  console.log(`   Admin:    ${process.env.ADMIN_SECRET ? '✅' : '⚠️  set ADMIN_SECRET'}\n`);
+  console.log(`   Stripe SK:  ${process.env.STRIPE_SECRET_KEY ? '✅' : '❌ MISSING'}`);
+  console.log(`   Stripe PK:  ${process.env.STRIPE_PUBLISHABLE_KEY ? '✅' : '❌ MISSING — set STRIPE_PUBLISHABLE_KEY'}`);
+  console.log(`   Stripe WHK: ${process.env.STRIPE_WEBHOOK_SECRET ? '✅' : '❌ MISSING — set STRIPE_WEBHOOK_SECRET'}`);
+  console.log(`   Supabase:   ${process.env.SUPABASE_URL ? '✅' : '❌ MISSING'}`);
+  console.log(`   Admin:      ${process.env.ADMIN_SECRET ? '✅' : '⚠️  set ADMIN_SECRET'}\n`);
 });
