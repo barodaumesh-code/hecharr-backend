@@ -83,7 +83,7 @@ app.post('/create-payment-intent', async (req, res) => {
     // Fall back to USD if currency not supported by Stripe
     const stripeCurrency = STRIPE_SUPPORTED.includes(rawCurrency) ? rawCurrency : 'USD';
 
-    const idempotencyKey = `pi-${(validEmail || 'guest').replace(/[^a-z0-9]/gi,'-')}-${Math.round(amount)}-${stripeCurrency}`;
+    const idempotencyKey = `pi-${(validEmail || 'guest').replace(/[^a-z0-9]/gi,'-')}-${Math.round(amount)}-${stripeCurrency}-${Date.now()}-${Math.random().toString(36).substr(2,6)}`;
 
     const paymentIntent = await stripe.paymentIntents.create({
       amount: Math.round(amount),
